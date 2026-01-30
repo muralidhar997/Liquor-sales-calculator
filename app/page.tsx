@@ -1,5 +1,6 @@
 import LoginCard from "../components/LoginCard";
 
+
 export default function HomePage() {
   return (
     <div className="grid place-items-center">
@@ -12,3 +13,5 @@ export default function HomePage() {
     </div>
   );
 }
+
+
