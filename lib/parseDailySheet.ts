@@ -1,31 +1,17 @@
-// lib/parseDailySheet.ts
-
-export type ParsedLineItem = {
+export type ParsedRow = {
   brandName: string;
-  sizeMl?: number;
-
   opening?: number;
   received?: number;
   total?: number;
   others?: number;
   closing?: number;
-
   salesQty?: number;
   rate?: number;
-  salesAmount?: number;
-};
-
-export type ParsedRow = {
-  brandName: string;
-  sizeMl: number;
-  opening: number;
-  received: number;
-  sold: number;
-  closing: number;
+  salesAmount?: number; // ✅ this is what you want to update
 };
 
 export type ParsedAudit = {
-  auditDate?: string; // YYYY-MM-DD
+  auditDate?: string; // YYYY-MM-DD (you will also pick date in UI)
   openingBalance?: number;
   totalSales?: number;
   officeCashNight?: number;
@@ -33,17 +19,34 @@ export type ParsedAudit = {
   expenditure?: number;
   balance?: number;
 
-  lineItems: ParsedLineItem[];
   rows: ParsedRow[];
-
   rawText: string;
 };
 
+/* ---------------- helpers ---------------- */
+
 function toNumber(s: string | undefined): number | undefined {
   if (!s) return undefined;
-  const cleaned = s.replace(/[, ]/g, "").replace(/O/g, "0");
+  const cleaned = s
+    .replace(/[, ]/g, "")
+    .replace(/O/g, "0")
+    .replace(/o/g, "0");
   const m = cleaned.match(/-?\d+(?:\.\d+)?/);
   return m ? Number(m[0]) : undefined;
+}
+
+function cleanOcrText(raw: string) {
+  return raw
+    .replace(/\r/g, "\n")
+    .replace(/\t/g, " ")
+    .replace(/[ ]{2,}/g, " ")
+    .replace(/\n{2,}/g, "\n")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    // ✅ drop noisy single-letter OCR lines
+    .filter((l) => !/^(Q|P|N)$/i.test(l))
+    .join("\n");
 }
 
 function findMoney(text: string, label: RegExp) {
@@ -51,53 +54,87 @@ function findMoney(text: string, label: RegExp) {
   return m ? toNumber(m[1]) : undefined;
 }
 
-function safeInt(n: number | undefined): number {
-  if (n === undefined || Number.isNaN(n)) return 0;
-  // most of your sheet columns are counts; round safely
-  return Math.round(n);
+/**
+ * Extract row lines that come AFTER the known header.
+ * Your header:
+ * "Sl. No. Brand Name O.B Received Total Others C.B Sales Rate Sales Amount"
+ */
+function extractRowLines(text: string): string[] {
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+
+  const headerIdx = lines.findIndex((l) =>
+    /Sl\.\s*No\.\s*Brand\s*Name\s*O\.?B\s*Received\s*Total\s*Others\s*C\.?B\s*Sales\s*Rate\s*Sales\s*Amount/i.test(l)
+  );
+
+  if (headerIdx === -1) {
+    // fallback: try looser header detection
+    const looseIdx = lines.findIndex((l) =>
+      /Brand\s*Name.*O\.?B.*Received.*Total.*C\.?B.*Sales.*Sales\s*Amount/i.test(l)
+    );
+    if (looseIdx === -1) return [];
+    return lines.slice(looseIdx + 1);
+  }
+
+  return lines.slice(headerIdx + 1);
 }
 
-function inferSizeMl(brand: string): number | undefined {
-  const m = brand.match(/\b(180|200|275|300|330|375|500|650|700|720|750|900|1000|1500|1800|2000)\b/);
-  return m ? Number(m[1]) : undefined;
-}
+/**
+ * Parse a single line like:
+ * "1 civas regal  10  2  12  0  6  6  3500  21000"
+ */
+function parseRowLine(line: string): ParsedRow | null {
+  // must start with serial number
+  const m = line.match(/^(\d+)\s+(.*)$/);
+  if (!m) return null;
 
-function buildRows(lineItems: ParsedLineItem[]): ParsedRow[] {
-  return lineItems.map((li) => {
-    const sizeMl = li.sizeMl ?? inferSizeMl(li.brandName) ?? 0;
+  const rest = m[2].trim();
 
-    return {
-      brandName: li.brandName,
-      sizeMl,
-      opening: safeInt(li.opening),
-      received: safeInt(li.received),
-      sold: safeInt(li.salesQty),
-      closing: safeInt(li.closing),
-    };
-  });
+  // get all numeric tokens
+  const nums = Array.from(rest.matchAll(/-?\d+(?:\.\d+)?/g)).map((x) => Number(x[0]));
+
+  // We need at least these columns:
+  // O.B, Received, Total, Others, C.B, Sales, Rate, SalesAmount  => 8 numbers
+  if (nums.length < 6) return null;
+
+  // brand text = everything before the first number chunk
+  const firstNumPos = rest.search(/-?\d/);
+  if (firstNumPos <= 0) return null;
+
+  const brand = rest.slice(0, firstNumPos).trim();
+  if (!brand) return null;
+
+  // Map last columns best-effort:
+  // Often last is Sales Amount, before that Rate, before that Sales Qty
+  const salesAmount = nums.length >= 1 ? nums[nums.length - 1] : undefined;
+  const rate = nums.length >= 2 ? nums[nums.length - 2] : undefined;
+  const salesQty = nums.length >= 3 ? nums[nums.length - 3] : undefined;
+
+  // Earlier columns (best effort, depends on sheet)
+  // We'll take from start:
+  const opening = nums[0];
+  const received = nums[1];
+  const total = nums[2];
+  const others = nums[3];
+  const closing = nums[4];
+
+  return {
+    brandName: brand,
+    opening,
+    received,
+    total,
+    others,
+    closing,
+    salesQty,
+    rate,
+    salesAmount,
+  };
 }
 
 export function parseDailySheetText(rawText: string): ParsedAudit {
-  const text = rawText
-    .replace(/\r/g, "\n")
-    .replace(/\n{2,}/g, "\n")
-    .replace(/\t/g, " ")
-    .replace(/ +/g, " ")
-    .trim();
+  const text = cleanOcrText(rawText);
 
-  // Date heuristic (DD/MM/YYYY or DD-MM-YYYY)
-  let auditDate: string | undefined;
-  const dm = text.match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
-  if (dm) {
-    const d = dm[1].padStart(2, "0");
-    const m = dm[2].padStart(2, "0");
-    const y = dm[3].length === 2 ? "20" + dm[3] : dm[3];
-    auditDate = `${y}-${m}-${d}`;
-  }
-
-  // Summary fields (OCR is noisy; keep regex flexible)
+  // Summary fields (keep flexible; if not present we still compute totalSales from rows)
   const openingBalance = findMoney(text, /Opening\s*Balance\s*[:\-]?\s*(\d[\d, .O-]*)/i);
-
   const officeCashNight =
     findMoney(text, /Office\s*Cash\s*\(?\s*Night\s*\)?\s*[:\-]?\s*(\d[\d, .O-]*)/i) ??
     findMoney(text, /Office\s*Cash\s*Night\s*[:\-]?\s*(\d[\d, .O-]*)/i);
@@ -109,72 +146,33 @@ export function parseDailySheetText(rawText: string): ParsedAudit {
   const expenditure = findMoney(text, /Expendit\w*\s*[:\-]?\s*(\d[\d, .O-]*)/i);
   const balance = findMoney(text, /Balance\s*[:\-]?\s*(\d[\d, .O-]*)/i);
 
-  // Total sales often appears as "Total Sales" or "Sales Amount Total"
-  const totalSales =
+  // Rows
+  const rowLines = extractRowLines(text);
+  const rows: ParsedRow[] = [];
+
+  for (const line of rowLines) {
+    // stop if we hit footer-ish text
+    if (/^Total\b|^Grand\b|^Signature\b/i.test(line)) break;
+
+    const parsed = parseRowLine(line);
+    if (parsed) rows.push(parsed);
+  }
+
+  // totalSales: prefer from sheet if present, otherwise sum Sales Amount
+  const sheetTotalSales =
     findMoney(text, /Total\s*Sales\s*[:\-]?\s*(\d[\d, .O-]*)/i) ??
     findMoney(text, /Sales\s*Amount\s*Total\s*[:\-]?\s*(\d[\d, .O-]*)/i);
 
-  const lines = text
-    .split("\n")
-    .map((l) => l.trim())
-    .filter(Boolean);
-
-  const lineItems: ParsedLineItem[] = [];
-
-  for (const line of lines) {
-    // Skip headers
-    if (/DAILY\s*SHEET|BRAND|O\.B|OPENING|RECEIVED|TOTAL\b/i.test(line)) continue;
-
-    // Extract all numbers
-    const nums = Array.from(line.matchAll(/-?\d+(?:\.\d+)?/g)).map((m) => Number(m[0]));
-    if (nums.length < 5) continue;
-
-    // Brand part: remove trailing numeric chunks (best effort)
-    const brandPart = line.replace(/(-?\d+(?:\.\d+)?[ ,]*){5,}$/g, "").trim();
-    if (brandPart.length < 2) continue;
-
-    const sizeMl = inferSizeMl(brandPart);
-
-    // Best-effort mapping:
-    // We assume the *last* number is salesAmount, then rate, then salesQty.
-    const salesAmount = nums[nums.length - 1];
-    const rate = nums.length >= 2 ? nums[nums.length - 2] : undefined;
-    const salesQty = nums.length >= 3 ? nums[nums.length - 3] : undefined;
-
-    // Earlier columns (best effort)
-    const closing = nums.length >= 4 ? nums[nums.length - 4] : undefined;
-    const others = nums.length >= 5 ? nums[nums.length - 5] : undefined;
-
-    // First columns typically:
-    const opening = nums[0];
-    const received = nums[1];
-    const total = nums[2];
-
-    lineItems.push({
-      brandName: brandPart,
-      sizeMl,
-      opening,
-      received,
-      total,
-      others,
-      closing,
-      salesQty,
-      rate,
-      salesAmount,
-    });
-  }
-
-  const rows = buildRows(lineItems);
+  const computedTotalSales = rows.reduce((sum, r) => sum + (r.salesAmount ?? 0), 0);
+  const totalSales = sheetTotalSales ?? (computedTotalSales > 0 ? computedTotalSales : undefined);
 
   return {
-    auditDate,
     openingBalance,
     totalSales,
     officeCashNight,
     officeCashSheet,
     expenditure,
     balance,
-    lineItems,
     rows,
     rawText,
   };

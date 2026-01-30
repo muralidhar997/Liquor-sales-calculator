@@ -1,189 +1,104 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { Button, Card, FieldRow, Input, Select } from "./ui";
+import { useState } from "react";
+import { supabase } from "../lib/supabase";
+import { Card } from "./ui";
+import type { FileObject } from "@supabase/storage-js";
 
-type Store = { id: string; name: string };
-type UserCode = { id: string; store_id: string; code4: string; is_active: boolean; store_name: string };
+type StoredPdf = {
+  name: string; // YYYY-MM-DD.pdf
+  date: string; // YYYY-MM-DD
+  path: string; // storeId/name
+};
+
+function keepLast30(files: StoredPdf[]) {
+  const sorted = [...files].sort((a, b) => (a.date < b.date ? 1 : -1));
+  return sorted.slice(0, 30);
+}
 
 export default function AdminPanel() {
-  const [authed, setAuthed] = useState(false);
-  const [password, setPassword] = useState("");
-  const [stores, setStores] = useState<Store[]>([]);
-  const [codes, setCodes] = useState<UserCode[]>([]);
-  const [storeName, setStoreName] = useState("");
-  const [selectedStore, setSelectedStore] = useState("");
-  const [code4, setCode4] = useState("");
+  const [storeId, setStoreId] = useState("");
+  const [files, setFiles] = useState<StoredPdf[]>([]);
+  const [error, setError] = useState("");
 
   async function load() {
-    const res = await fetch("/api/admin/list");
-    if (!res.ok) return;
-    const data = await res.json();
-    setStores(data.stores);
-    setCodes(data.codes);
-    if (!selectedStore && data.stores?.[0]?.id) setSelectedStore(data.stores[0].id);
-  }
+    setError("");
+    setFiles([]);
 
-  async function loginAdmin() {
-    const res = await fetch("/api/admin/login", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ password })
-    });
-    if (!res.ok) {
-      alert("Wrong password");
+    if (!/^\d{4}$/.test(storeId)) {
+      setError("Enter a valid 4-digit storeId.");
       return;
     }
-    setAuthed(true);
-    await load();
-  }
 
-  async function createStore() {
-    const name = storeName.trim();
-    if (!name) return;
-    const res = await fetch("/api/admin/create-store", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ name })
+    const { data, error } = await supabase.storage.from("daily-sheets").list(storeId, {
+      limit: 200,
+      offset: 0,
+      sortBy: { column: "name", order: "desc" },
     });
-    const data = await res.json();
-    if (!res.ok) return alert(data?.error ?? "Failed");
-    setStoreName("");
-    await load();
+
+    if (error) {
+      setError(error.message);
+      return;
+    }
+
+    const mapped: StoredPdf[] = (data ?? [])
+      .filter((x: FileObject) => (x.name ?? "").toLowerCase().endsWith(".pdf"))
+      .map((x: FileObject) => {
+        const name = x.name;
+        const date = name.replace(/\.pdf$/i, "");
+        return { name, date, path: `${storeId}/${name}` };
+      })
+      .filter((x: StoredPdf) => /^\d{4}-\d{2}-\d{2}$/.test(x.date));
+
+    setFiles(keepLast30(mapped));
   }
 
-  async function createCode() {
-    if (!/^\d{4}$/.test(code4)) return alert("Code must be 4 digits");
-    if (!selectedStore) return alert("Select a store");
-    const res = await fetch("/api/admin/create-code", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ storeId: selectedStore, code4 })
-    });
-    const data = await res.json();
-    if (!res.ok) return alert(data?.error ?? "Failed");
-    setCode4("");
-    await load();
-  }
-
-  async function rotateCode(storeId: string) {
-    const res = await fetch("/api/admin/rotate-code", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ storeId })
-    });
-    const data = await res.json();
-    if (!res.ok) return alert(data?.error ?? "Failed");
-    await load();
-  }
-
-  async function toggleActive(codeId: string, is_active: boolean) {
-    const res = await fetch("/api/admin/toggle-code", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ codeId, is_active: !is_active })
-    });
-    const data = await res.json();
-    if (!res.ok) return alert(data?.error ?? "Failed");
-    await load();
-  }
-
-  useEffect(() => {
-    // If already logged in (cookie), list works
-    (async () => {
-      const res = await fetch("/api/admin/list");
-      if (res.ok) {
-        setAuthed(true);
-        const data = await res.json();
-        setStores(data.stores);
-        setCodes(data.codes);
-        if (data.stores?.[0]?.id) setSelectedStore(data.stores[0].id);
-      }
-    })();
-  }, []);
-
-  if (!authed) {
-    return (
-      <div className="grid place-items-center">
-        <div className="w-full max-w-md">
-          <Card title="Admin Login">
-            <div className="space-y-3">
-              <Input label="Admin password" type="password" value={password} onChange={e=>setPassword(e.target.value)} />
-              <Button onClick={loginAdmin}>Login</Button>
-              <div className="text-xs text-zinc-600">
-                Set password in <code>ADMIN_PASSWORD</code>.
-              </div>
-            </div>
-          </Card>
-        </div>
-      </div>
-    );
+  async function openPdf(path: string) {
+    const { data, error } = await supabase.storage.from("daily-sheets").createSignedUrl(path, 60 * 20);
+    if (error) {
+      alert(error.message);
+      return;
+    }
+    window.open(data.signedUrl, "_blank");
   }
 
   return (
-    <div className="space-y-4">
-      <Card title="Create Store">
-        <div className="flex gap-2">
-          <Input value={storeName} onChange={e=>setStoreName(e.target.value)} placeholder="Store name (e.g. Downtown Liquors)" />
-          <Button onClick={createStore}>Create</Button>
-        </div>
-      </Card>
-
-      <Card title="Create 4-digit User Code linked to Store">
-        <div className="space-y-3">
-          <FieldRow>
-            <Select label="Store" value={selectedStore} onChange={e=>setSelectedStore(e.target.value)}>
-              {stores.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-            </Select>
-            <Input
-              label="4-digit code"
-              inputMode="numeric"
-              maxLength={4}
-              value={code4}
-              onChange={(e)=>setCode4(e.target.value.replace(/\D/g, "").slice(0,4))}
-              placeholder="1234"
+    <div className="max-w-2xl mx-auto space-y-4">
+      <Card title="Admin: PDF Storage (Last 30 days)">
+        <div className="flex gap-2 items-end">
+          <div className="flex-1">
+            <div className="text-xs text-zinc-600 mb-1">Store ID (4 digits)</div>
+            <input
+              value={storeId}
+              onChange={(e) => setStoreId(e.target.value)}
+              className="w-full border rounded px-2 py-1 text-sm"
+              placeholder="e.g. 1234"
             />
-          </FieldRow>
-          <Button onClick={createCode}>Create code</Button>
-          <div className="text-xs text-zinc-600">
-            Extra options included: Rotate code & Disable code.
           </div>
+
+          <button onClick={load} className="border rounded px-3 py-2 text-sm bg-zinc-900 text-white">
+            Load
+          </button>
         </div>
+
+        {error ? <div className="text-sm text-red-600 mt-2">{error}</div> : null}
       </Card>
 
-      <Card title="Existing Codes">
-        <div className="overflow-auto">
-          <table className="min-w-full text-sm">
-            <thead className="bg-white sticky top-0">
-              <tr className="text-left border-b border-zinc-200">
-                <th className="py-2 pr-3">Store</th>
-                <th className="py-2 pr-3">Code</th>
-                <th className="py-2 pr-3">Active</th>
-                <th className="py-2 pr-3">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {codes.map(c => (
-                <tr key={c.id} className="border-b border-zinc-100">
-                  <td className="py-2 pr-3">{c.store_name}</td>
-                  <td className="py-2 pr-3 font-mono">{c.code4}</td>
-                  <td className="py-2 pr-3">{c.is_active ? "Yes" : "No"}</td>
-                  <td className="py-2 pr-3 flex flex-wrap gap-2">
-                    <Button variant="ghost" onClick={() => toggleActive(c.id, c.is_active)}>
-                      {c.is_active ? "Disable" : "Enable"}
-                    </Button>
-                    <Button variant="ghost" onClick={() => rotateCode(c.store_id)}>
-                      Rotate code
-                    </Button>
-                  </td>
-                </tr>
-              ))}
-              {!codes.length ? (
-                <tr><td className="py-3 text-zinc-600" colSpan={4}>No codes yet.</td></tr>
-              ) : null}
-            </tbody>
-          </table>
-        </div>
+      <Card title="Files">
+        {files.length === 0 ? (
+          <div className="text-sm text-zinc-600">No files loaded.</div>
+        ) : (
+          <div className="space-y-2">
+            {files.map((f) => (
+              <div key={f.path} className="flex items-center justify-between">
+                <div className="text-sm">{f.date}</div>
+                <button className="text-sm underline" onClick={() => openPdf(f.path)}>
+                  View
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
       </Card>
     </div>
   );
